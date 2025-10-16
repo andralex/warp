@@ -1208,6 +1208,7 @@ struct launch_bounds_t
     size_t size;                // total number of threads
     int offset;
     int partition_size;
+    int partition_blocks;       // number of CUDA blocks to launch when using partition
 };
 
 // represents coordinate in the launch grid
@@ -1259,10 +1260,23 @@ inline CUDA_CALLABLE int block_dim()
 #endif
 }
 
-inline CUDA_CALLABLE int apply_partition(const char *partition, int index, const launch_bounds_t& bounds)
+inline CUDA_CALLABLE int apply_partition(int rank, const int* shape, const int* strides, int index, const launch_bounds_t& bounds)
 {
-    printf("[apply_partition] index %d partition %s offset %d partition_size %d\n", index, partition, bounds.offset, bounds.partition_size);
-    return 0;
+    if (rank == 0) {
+        return index;  // No partition, return index as-is
+    }
+    
+    // Convert flat index to multi-dimensional coordinates and apply strides
+    int offset = 0;
+    int remaining = index;
+    
+    for (int i = 0; i < rank; i++) {
+        int coord = remaining % shape[i];
+        offset += coord * strides[i];
+        remaining = remaining / shape[i];
+    }
+    
+    return offset;
 }
 
 // THERE

@@ -1885,9 +1885,18 @@ class ModuleBuilder:
         if device == "cpu":
             source = warp.codegen.cpu_module_header.format(block_dim=self.options["block_dim"]) + source
         else:
-            import traceback
-            traceback.print_stack()
-            source = warp.codegen.cuda_module_header.format(block_dim=self.options["block_dim"], have_partition=self.options["have_partition"], partition=self.options["partition"]) + source
+            # Parse partition to extract shape and stride arrays
+            partition_rank, partition_shape, partition_strides = warp.codegen.parse_cute_partition(self.options["partition"])
+            partition_shape_str = ", ".join(map(str, partition_shape)) if partition_shape else ""
+            partition_strides_str = ", ".join(map(str, partition_strides)) if partition_strides else ""
+            
+            source = warp.codegen.cuda_module_header.format(
+                block_dim=self.options["block_dim"], 
+                have_partition=self.options["have_partition"], 
+                partition_rank=partition_rank,
+                partition_shape=partition_shape_str,
+                partition_strides=partition_strides_str
+            ) + source
 
         return source
 
@@ -6277,8 +6286,18 @@ def launch(
 
     # construct launch bounds
     bounds = launch_bounds_t(dim)
-    # TODO
-    bounds.set_partition_params(offset, bounds.size)
+    
+    # Compute partition blocks if partition is specified
+    partition_blocks = 0
+    if partition is not None:
+        rank, partition_shape, partition_strides = warp.codegen.parse_cute_partition(partition)
+        # Compute product of partition shape to get number of blocks
+        partition_blocks = 1
+        for s in partition_shape:
+            partition_blocks *= s
+        print(f"Partition shape: {partition_shape}, computed blocks: {partition_blocks}")
+    
+    bounds.set_partition_params(offset, bounds.size, partition_blocks)
     print(f"bounds {bounds}")
 
     if bounds.size > 0:

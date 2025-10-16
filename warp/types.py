@@ -1614,6 +1614,14 @@ ARRAY_TYPE_INDEXED = 1
 ARRAY_TYPE_FABRIC = 2
 ARRAY_TYPE_FABRIC_INDEXED = 3
 
+LAYOUT_MAX_DIMS = 5
+
+class layout_t(ctypes.Structure):
+    _fields_ = (
+        ("shape", ctypes.c_int32 * LAUNCH_MAX_DIMS),
+        ("stride", ctypes.c_int32 * LAUNCH_MAX_DIMS),
+        ("ndim", ctypes.c_int32),
+    )
 
 # represents bounds for kernel launch (number of threads across multiple dimensions)
 class launch_bounds_t(ctypes.Structure):
@@ -1622,7 +1630,8 @@ class launch_bounds_t(ctypes.Structure):
         ("ndim", ctypes.c_int32),
         ("size", ctypes.c_size_t),
         ("offset", ctypes.c_int32),
-        ("partition_size", ctypes.c_int32)
+        ("partition_size", ctypes.c_int32),
+        ("partition_blocks", ctypes.c_int32)  # Number of CUDA blocks to launch when using partition
     )
 
     def __init__(self, shape: int | Sequence[int]):
@@ -1632,12 +1641,14 @@ class launch_bounds_t(ctypes.Structure):
             self.size = shape
             self.shape[0] = shape
             self.offset = 0
+            self.partition_blocks = 0
 
         else:
             # nd launch
             self.ndim = len(shape)
             self.size = 1
             self.offset = 0
+            self.partition_blocks = 0
 
             for i in range(self.ndim):
                 self.shape[i] = shape[i]
@@ -1647,15 +1658,17 @@ class launch_bounds_t(ctypes.Structure):
         for i in range(self.ndim, LAUNCH_MAX_DIMS):
             self.shape[i] = 1
 
-    def set_partition_params(self, offset, psize):
+    def set_partition_params(self, offset, psize, pblocks=0):
         self.offset = offset
         self.partition_size = psize
+        self.partition_blocks = pblocks
 
     def __repr__(self):
         shape_tuple = tuple(self.shape[i] for i in range(self.ndim))
         return (
             f"launch_bounds_t(shape={shape_tuple}, ndim={self.ndim}, "
-            f"size={self.size}, offset={self.offset}, partition_size={self.partition_size})"
+            f"size={self.size}, offset={self.offset}, partition_size={self.partition_size}, "
+            f"partition_blocks={self.partition_blocks})"
         )
 
 

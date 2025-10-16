@@ -3538,6 +3538,42 @@ class Adjoint:
 # ----------------
 # code generation
 
+def parse_cute_partition(partition_str):
+    """Parse a Cute layout partition string like '(8,4,2):(3,4,1)'.
+    
+    Returns:
+        tuple: (rank, shape_list, stride_list) or (0, [], []) if partition_str is None
+    """
+    if partition_str is None:
+        return (0, [], [])
+    
+    # Split by ':' to separate shape and strides
+    parts = partition_str.split(':')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid partition format: {partition_str}. Expected format: '(a,b,c):(d,e,f)'")
+    
+    shape_str, stride_str = parts
+    
+    # Parse shape tuple
+    shape_str = shape_str.strip()
+    if not (shape_str.startswith('(') and shape_str.endswith(')')):
+        raise ValueError(f"Invalid shape format: {shape_str}. Expected format: '(a,b,c)'")
+    shape_list = [int(x.strip()) for x in shape_str[1:-1].split(',') if x.strip()]
+    
+    # Parse stride tuple
+    stride_str = stride_str.strip()
+    if not (stride_str.startswith('(') and stride_str.endswith(')')):
+        raise ValueError(f"Invalid stride format: {stride_str}. Expected format: '(d,e,f)'")
+    stride_list = [int(x.strip()) for x in stride_str[1:-1].split(',') if x.strip()]
+    
+    # Validate that both have the same length
+    if len(shape_list) != len(stride_list):
+        raise ValueError(f"Shape and stride must have same length. Got shape={shape_list}, stride={stride_list}")
+    
+    rank = len(shape_list)
+    return (rank, shape_list, stride_list)
+
+
 cpu_module_header = """
 #define WP_TILE_BLOCK_DIM {block_dim}
 #define WP_NO_CRT
@@ -3562,13 +3598,17 @@ cpu_module_header = """
 cuda_module_header = """
 #define WP_TILE_BLOCK_DIM {block_dim}
 #define WP_HAVE_PARTITION {have_partition}
-#define WP_PARTITION {partition}
 #define WP_NO_CRT
 #include "builtin.h"
 
-// Stringification helper macros
-#define WP_STRINGIFY(x) #x
-#define WP_TOSTRING(x) WP_STRINGIFY(x)
+// Partition layout definition
+#if WP_HAVE_PARTITION
+#define WP_PARTITION_RANK {partition_rank}
+constexpr int WP_PARTITION_SHAPE[] = {{{partition_shape}}};
+constexpr int WP_PARTITION_STRIDES[] = {{{partition_strides}}};
+#else
+#define WP_PARTITION_RANK 0
+#endif
 
 // Map wp.breakpoint() to a device brkpt at the call site so cuda-gdb attributes the stop to the generated .cu line
 #if defined(__CUDACC__) && !defined(_MSC_VER)
@@ -3589,7 +3629,11 @@ cuda_module_header = """
 
 #define builtin_block_dim() wp::block_dim()
 
-#define builtin_apply_partition(x) wp::apply_partition(WP_TOSTRING(WP_PARTITION), x, dim)
+#if WP_HAVE_PARTITION
+#define builtin_apply_partition(x) wp::apply_partition(WP_PARTITION_RANK, WP_PARTITION_SHAPE, WP_PARTITION_STRIDES, x, dim)
+#else
+#define builtin_apply_partition(x) (x)
+#endif
 """
 
 struct_template = """
@@ -3676,8 +3720,7 @@ cuda_kernel_template_forward = """
         // reset shared memory allocator
 {line_directive}        #if WP_HAVE_PARTITION
 {line_directive}        size_t block_id = _idx_orig/blockDim.x;
-{line_directive}        size_t virtual_block_id = block_id + dim.offset;
-{line_directive}        builtin_apply_partition(virtual_block_id);
+{line_directive}        size_t virtual_block_id = builtin_apply_partition(block_id)+dim.offset;
 {line_directive}        size_t _idx = (_idx_orig%blockDim.x) + virtual_block_id * blockDim.x;
 {line_directive}        #else
 {line_directive}        size_t _idx = _idx_orig;
