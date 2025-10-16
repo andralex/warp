@@ -34,6 +34,10 @@ from warp.fabric import indexedfabricarray as indexedfabricarray
 from warp.fabric import indexedfabricarrayarray as indexedfabricarrayarray
 from warp.types import tile as tile
 from warp.types import Layout as Layout
+from warp.types import PartitionResult as PartitionResult
+from warp.types import blocked as blocked
+from warp.types import cyclic as cyclic
+from warp.types import block_cyclic as block_cyclic
 
 from warp.types import bool as bool
 from warp.types import int8 as int8

@@ -1267,10 +1267,11 @@ inline CUDA_CALLABLE int apply_partition(int rank, const int* shape, const int* 
     }
     
     // Convert flat index to multi-dimensional coordinates and apply strides
+    // For row-major ordering, iterate backwards (last dimension varies fastest)
     int offset = 0;
     int remaining = index;
     
-    for (int i = 0; i < rank; i++) {
+    for (int i = rank - 1; i >= 0; i--) {
         int coord = remaining % shape[i];
         offset += coord * strides[i];
         remaining = remaining / shape[i];

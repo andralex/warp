@@ -1941,15 +1941,17 @@ class Layout:
         """
         return self.stride[-1] == 1
     
-    def __call__(self, *args: int) -> int:
+    def __call__(self, *args) -> int:
         """Make Layout callable like CuTe's Layout function object.
         
-        Supports two modes:
-        1. Single argument: treats as linear index, returns layout offset
-        2. Multiple arguments: treats as coordinates, returns layout offset
+        Supports three modes:
+        1. Single integer: treats as linear index, returns layout offset
+        2. Single tuple/list: unpacks as coordinates, returns layout offset
+        3. Multiple arguments: treats as coordinates, returns layout offset
         
         Args:
-            *args: Either a single linear index or multiple coordinates
+            *args: Either a single linear index, a tuple/list of coordinates,
+                   or multiple coordinate arguments
         
         Returns:
             Layout offset
@@ -1957,17 +1959,26 @@ class Layout:
         Examples:
             layout = Layout(shape=(5, 10), stride=(10, 20))
             
-            # Linear index mode (single argument)
+            # Linear index mode (single integer)
             layout(7)      # → 140 (converts 7 to coord (0,7), then 0*10+7*20)
             layout(12)     # → 50  (converts 12 to coord (1,2), then 1*10+2*20)
+            
+            # Coordinate mode (tuple/list)
+            layout((0, 7)) # → 140 (0*10 + 7*20)
+            layout([1, 2]) # → 50  (1*10 + 2*20)
             
             # Coordinate mode (multiple arguments)
             layout(0, 7)   # → 140 (0*10 + 7*20)
             layout(1, 2)   # → 50  (1*10 + 2*20)
         """
         if len(args) == 1:
-            # Single argument: linear index → offset
-            return self.linear_to_offset(args[0])
+            arg = args[0]
+            # Check if argument is a tuple or list (coordinates)
+            if isinstance(arg, (tuple, list)):
+                return self.coord_to_offset(*arg)
+            # Otherwise treat as linear index
+            else:
+                return self.linear_to_offset(arg)
         else:
             # Multiple arguments: coordinates → offset
             return self.coord_to_offset(*args)
@@ -1982,6 +1993,261 @@ class Layout:
         if not isinstance(other, Layout):
             return False
         return self.shape == other.shape and self.stride == other.stride
+
+
+# ==============================================================================
+# Partitioning Policies
+# ==============================================================================
+
+class PartitionResult:
+    """Result of a partitioning policy.
+    
+    Contains the partition layout and optional offset information for
+    iterating over the partitioned work.
+    
+    Attributes:
+        partition: Layout describing the partitioning scheme
+        offsets: List of offsets for iterating over partitions (optional)
+        block_shape: Shape of each block/partition (optional)
+    """
+    
+    def __init__(self, partition: Layout, offsets: list[int] | None = None, 
+                 block_shape: tuple[int, ...] | None = None):
+        self.partition = partition
+        self.offsets = offsets if offsets is not None else list(range(partition.size))
+        self.block_shape = block_shape
+        print(f"PartitionResult: {self}")
+        print(f"  Partition: {self.partition}")
+        print(f"  Offsets: {self.offsets}")
+        print(f"  Block shape: {self.block_shape}")
+    
+    def __repr__(self) -> str:
+        return f"PartitionResult(partition={self.partition}, offsets={self.offsets[:5]}{'...' if len(self.offsets) > 5 else ''}, block_shape={self.block_shape})"
+
+
+def blocked(dim: tuple[int, ...] | list[int], 
+            places: int | tuple[int, ...] | list[int] | Layout) -> PartitionResult:
+    """Create a blocked (contiguous) partitioning scheme.
+    
+    Divides the flattened problem space into contiguous blocks. Each place gets
+    a contiguous chunk of elements for good spatial locality.
+    
+    Algorithm:
+    1. Compute total_size = product of dim
+    2. Compute nplaces from places argument
+    3. part_size = total_size / nplaces (size of each chunk)
+    4. Partition layout = (part_size, 1) - each place processes part_size contiguous elements
+    5. Offsets layout = (nplaces, part_size) - stride by part_size to get to next block
+    
+    Args:
+        dim: Total problem dimensions (e.g., (10, 10) = 100 elements)
+        places: Number of partitions
+                - int: Total number of blocks
+                - tuple/list: Shape to compute product (e.g., (2, 2) = 4 places)
+                - Layout: Use layout.size as number of places
+    
+    Returns:
+        PartitionResult with:
+        - partition: Layout for the work in each place (part_size, 1)
+        - offsets: Layout for iterating over places (nplaces, part_size)
+        - block_shape: (part_size,)
+    
+    Examples:
+        # Divide 10x10 grid (100 elements) into 4 blocks
+        result = blocked(dim=(10, 10), places=4)
+        # partition: Layout(shape=(25, 1), stride=(1, 1)) - each place gets 25 elements
+        # offsets: Layout(shape=(4,), stride=(25,)) - stride by 25 to next block
+        
+        # Divide 100 elements into 4 blocks
+        result = blocked(dim=(100,), places=4)
+        # partition: Layout(shape=(25, 1), stride=(1, 1))
+        # offsets: Layout(shape=(4,), stride=(25,))
+    """
+    dim = tuple(dim) if isinstance(dim, list) else dim
+    
+    # Compute total size (flatten the problem space)
+    total_size = 1
+    for d in dim:
+        total_size *= int(d)  # Ensure int
+    
+    # Parse places argument to get number of places
+    if isinstance(places, Layout):
+        nplaces = int(places.size)
+    elif isinstance(places, int):
+        nplaces = int(places)
+    else:
+        # tuple/list: compute product
+        places_tuple = tuple(places)
+        nplaces = 1
+        for p in places_tuple:
+            nplaces *= int(p)
+    
+    # Compute part_size (size of each chunk) - ensure int
+    part_size = int((total_size + nplaces - 1) // nplaces)  # Ceiling division
+    
+    # Partition layout: each place processes part_size contiguous elements
+    partition = Layout(shape=(part_size, 1), stride=(1, 1))
+    
+    # Offsets layout: stride by part_size to get to next place
+    offsets_layout = Layout(shape=(nplaces,), stride=(part_size,))
+    
+    # Generate offsets list (ensure ints)
+    offsets = [int(offsets_layout(i)) for i in range(nplaces)]
+    
+    return PartitionResult(
+        partition=partition,
+        offsets=offsets,
+        block_shape=(part_size,)
+    )
+
+
+def cyclic(dim: tuple[int, ...] | list[int],
+           places: int | tuple[int, ...] | list[int] | Layout,
+           block_size: int | tuple[int, ...] | None = None) -> PartitionResult:
+    """Create a cyclic (round-robin) partitioning scheme.
+    
+    Distributes work in a round-robin fashion. Each place gets every Nth element
+    where N is the number of places in that dimension.
+    
+    For a 2D grid with places (2, 2):
+    - Place (0,0) gets elements at (0,0), (0,2), (0,4), (2,0), (2,2), (2,4), ...
+    - Place (0,1) gets elements at (0,1), (0,3), (0,5), (2,1), (2,3), (2,5), ...
+    - etc.
+    
+    Args:
+        dim: Total problem dimensions (e.g., (12, 8) for 12x8 grid)
+        places: Grid arrangement of places
+                - int: Total number (tries to factor into grid)
+                - tuple: Grid shape (e.g., (2, 2) for 2x2 grid)
+                - Layout: Use layout.shape as grid
+        block_size: Not used (reserved for future block-cyclic)
+    
+    Returns:
+        PartitionResult with:
+        - partition: Layout each place uses (shape = dim/places, stride = places)
+        - offsets: Layout for computing base offset of each place
+    
+    Examples:
+        # For dim=(12, 8), places=(2, 2):
+        # - Partition: (6, 4):(2, 2) - each place gets 6x4 elements with stride 2
+        # - Offsets: (2, 2):(1, dim[1]) - to compute starting offset for each place
+    """
+    dim = tuple(int(d) for d in dim) if isinstance(dim, list) else tuple(int(d) for d in dim)
+    rank = len(dim)
+    
+    # Parse places
+    if isinstance(places, Layout):
+        places_shape = places.shape
+    elif isinstance(places, int):
+        if rank == 1:
+            places_shape = (places,)
+        elif rank == 2:
+            import math
+            sqrt_places = int(math.sqrt(places))
+            while places % sqrt_places != 0 and sqrt_places > 1:
+                sqrt_places -= 1
+            places_shape = (sqrt_places, places // sqrt_places)
+        else:
+            places_shape = tuple([places] + [1] * (rank - 1))
+    else:
+        places_shape = tuple(int(p) for p in places)
+    
+    # Validate dimensions match
+    if len(places_shape) != rank:
+        raise ValueError(f"Places rank {len(places_shape)} doesn't match dim rank {rank}")
+    
+    # Compute partition shape: each place gets dim/places elements
+    partition_shape = tuple(
+        int((dim[i] + places_shape[i] - 1) // places_shape[i])  # Ceiling division
+        for i in range(rank)
+    )
+    
+    # Partition stride: for round-robin in the dim-space
+    # Stride by places_shape to skip to next element for this place
+    partition_stride = tuple(int(p) for p in places_shape)
+    
+    partition = Layout(shape=partition_shape, stride=partition_stride)
+    
+    # Offset layout: to compute base offset for each place in dim-space
+    # Offsets pattern: (places):(1, dim[0])
+    if rank == 1:
+        offset_stride = (1,)
+    elif rank == 2:
+        # Offset stride: (1, dim[0])
+        # Moving to next row of places: offset by 1
+        # Moving to next col of places: offset by dim[0] (row count)
+        offset_stride = (1, int(dim[0]))
+    else:
+        # General case: row-major strides
+        offset_stride = [1] * rank
+        for i in range(rank - 2, -1, -1):
+            offset_stride[i] = offset_stride[i + 1] * dim[i + 1]
+        offset_stride = tuple(int(s) for s in offset_stride)
+    
+    offsets_layout = Layout(shape=places_shape, stride=offset_stride)
+    
+    # Generate offsets list
+    offsets = [int(offsets_layout(i)) for i in range(offsets_layout.size)]
+    
+    return PartitionResult(
+        partition=partition,
+        offsets=offsets,
+        block_shape=partition_shape
+    )
+
+
+def block_cyclic(dim: tuple[int, ...] | list[int],
+                 places: int | tuple[int, ...] | list[int] | Layout,
+                 block_size: int | tuple[int, ...]) -> PartitionResult:
+    """Create a block-cyclic partitioning scheme.
+    
+    Combines blocked and cyclic approaches: distributes blocks of work
+    in a round-robin fashion. Good balance between locality and load balancing.
+    
+    Args:
+        dim: Total problem dimensions
+        places: Number of partitions or their arrangement  
+        block_size: Size of blocks to distribute cyclically
+    
+    Returns:
+        PartitionResult with partition layout and offsets
+    """
+    dim = tuple(dim) if isinstance(dim, list) else dim
+    rank = len(dim)
+    
+    # Parse places
+    if isinstance(places, Layout):
+        places_shape = places.shape
+    elif isinstance(places, int):
+        if rank == 1:
+            places_shape = (places,)
+        else:
+            import math
+            sqrt_places = int(math.sqrt(places))
+            while places % sqrt_places != 0 and sqrt_places > 1:
+                sqrt_places -= 1
+            if rank == 2:
+                places_shape = (sqrt_places, places // sqrt_places)
+            else:
+                places_shape = tuple([places] + [1] * (rank - 1))
+    else:
+        places_shape = tuple(places)
+    
+    # Parse block_size
+    if isinstance(block_size, int):
+        block_size_tuple = tuple([block_size] * rank)
+    else:
+        block_size_tuple = tuple(block_size)
+    
+    # Compute block-cyclic strides
+    stride = tuple(
+        block_size_tuple[i] * places_shape[i]
+        for i in range(rank)
+    )
+    
+    partition = Layout(shape=places_shape, stride=stride)
+    
+    return PartitionResult(partition=partition, block_shape=block_size_tuple)
 
 
 class slice_t:
