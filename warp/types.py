@@ -1677,6 +1677,313 @@ SLICE_BEGIN = (1 << (INT_WIDTH - 1)) - 1
 SLICE_END = -(1 << (INT_WIDTH - 1))
 
 
+class Layout:
+    """A layout descriptor for kernel partitioning, similar to CuTe's Layout concept.
+    
+    A Layout maps logical multi-dimensional coordinates to linear offsets using
+    shape (extent) and stride (step size) in each dimension.
+    
+    Examples:
+        # 2D round-robin partition: 5x5 blocks with strides (2, 20)
+        layout = wp.Layout(shape=(5, 5), stride=(2, 20))
+        
+        # 2D quadrant partition: 5x5 blocks with strides (1, 10)
+        layout = wp.Layout(shape=(5, 5), stride=(1, 10))
+        
+        # Row-major 1D partition
+        layout = wp.Layout(shape=(10,), stride=(1,))
+        
+        # Create from string (backward compatibility)
+        layout = wp.Layout.from_string("(5,5):(2,20)")
+    
+    Attributes:
+        shape (tuple[int, ...]): Extent in each dimension (number of blocks per dimension)
+        stride (tuple[int, ...]): Step size in each dimension  
+        rank (int): Number of dimensions
+        size (int): Total number of elements (product of shape)
+    """
+    
+    def __init__(self, shape: tuple[int, ...] | list[int], stride: tuple[int, ...] | list[int] | None = None):
+        """Initialize a Layout with shape and stride.
+        
+        Args:
+            shape: Extent in each dimension
+            stride: Step size in each dimension. If None, computes row-major strides.
+        
+        Raises:
+            ValueError: If shape is empty or if shape and stride have different lengths
+        """
+        if not shape or len(shape) == 0:
+            raise ValueError("Layout shape must have at least 1 dimension")
+        
+        self.shape = tuple(shape)
+        self.rank = len(self.shape)
+        
+        # Compute strides if not provided (row-major by default)
+        if stride is None:
+            self.stride = self._compute_row_major_strides(self.shape)
+        else:
+            if len(stride) != len(shape):
+                raise ValueError(
+                    f"Shape and stride must have same length. "
+                    f"Got shape={shape} (length {len(shape)}), stride={stride} (length {len(stride)})"
+                )
+            self.stride = tuple(stride)
+        
+        # Compute total size
+        self.size = 1
+        for s in self.shape:
+            self.size *= s
+    
+    @staticmethod
+    def _compute_row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+        """Compute row-major strides from shape."""
+        if len(shape) == 1:
+            return (1,)
+        
+        strides = [1] * len(shape)
+        for i in range(len(shape) - 2, -1, -1):
+            strides[i] = strides[i + 1] * shape[i + 1]
+        return tuple(strides)
+    
+    @staticmethod
+    def _compute_col_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+        """Compute column-major strides from shape."""
+        if len(shape) == 1:
+            return (1,)
+        
+        strides = [1] * len(shape)
+        for i in range(1, len(shape)):
+            strides[i] = strides[i - 1] * shape[i - 1]
+        return tuple(strides)
+    
+    @classmethod
+    def row_major(cls, shape: tuple[int, ...] | list[int]) -> "Layout":
+        """Create a row-major layout.
+        
+        Example:
+            Layout.row_major((4, 8)) -> shape=(4,8), stride=(8,1)
+        """
+        return cls(shape=shape, stride=None)
+    
+    @classmethod
+    def col_major(cls, shape: tuple[int, ...] | list[int]) -> "Layout":
+        """Create a column-major layout.
+        
+        Example:
+            Layout.col_major((4, 8)) -> shape=(4,8), stride=(1,4)
+        """
+        strides = cls._compute_col_major_strides(tuple(shape))
+        return cls(shape=shape, stride=strides)
+    
+    @classmethod
+    def from_string(cls, layout_str: str) -> "Layout":
+        """Parse a layout from CuTe-style string format '(shape):(stride)'.
+        
+        Args:
+            layout_str: String in format '(a,b,c):(d,e,f)'
+        
+        Returns:
+            Layout object
+        
+        Raises:
+            ValueError: If string format is invalid
+        
+        Example:
+            Layout.from_string("(5,5):(2,20)")
+        """
+        parts = layout_str.split(':')
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid layout format: {layout_str}. Expected format: '(a,b,c):(d,e,f)'"
+            )
+        
+        shape_str, stride_str = parts
+        
+        # Parse shape tuple
+        shape_str = shape_str.strip()
+        if not (shape_str.startswith('(') and shape_str.endswith(')')):
+            raise ValueError(f"Invalid shape format: {shape_str}. Expected format: '(a,b,c)'")
+        shape = tuple(int(x.strip()) for x in shape_str[1:-1].split(',') if x.strip())
+        
+        # Parse stride tuple
+        stride_str = stride_str.strip()
+        if not (stride_str.startswith('(') and stride_str.endswith(')')):
+            raise ValueError(f"Invalid stride format: {stride_str}. Expected format: '(d,e,f)'")
+        stride = tuple(int(x.strip()) for x in stride_str[1:-1].split(',') if x.strip())
+        
+        return cls(shape=shape, stride=stride)
+    
+    def to_string(self) -> str:
+        """Convert layout to CuTe-style string format '(shape):(stride)'.
+        
+        Returns:
+            String representation
+        
+        Example:
+            layout.to_string() -> "(5,5):(2,20)"
+        """
+        shape_str = f"({','.join(map(str, self.shape))})"
+        stride_str = f"({','.join(map(str, self.stride))})"
+        return f"{shape_str}:{stride_str}"
+    
+    def get_size(self) -> int:
+        """Get the total number of elements (product of shape dimensions).
+        
+        Returns:
+            Product of all shape dimensions
+        
+        Example:
+            layout = Layout(shape=(4, 8, 2))
+            layout.get_size() -> 64  # 4 * 8 * 2
+        
+        Note:
+            This is equivalent to accessing the `size` attribute directly.
+        """
+        return self.size
+    
+    def coord_to_offset(self, *coords: int) -> int:
+        """Map multi-dimensional coordinate to linear offset.
+        
+        Args:
+            *coords: Coordinate in each dimension
+        
+        Returns:
+            Linear offset computed as sum(coord[i] * stride[i])
+        
+        Example:
+            layout = Layout(shape=(4,8), stride=(8,1))
+            layout.coord_to_offset(2, 3) -> 19  # (2*8 + 3*1)
+        """
+        if len(coords) != self.rank:
+            raise ValueError(f"Expected {self.rank} coordinates, got {len(coords)}")
+        
+        offset = 0
+        for i, c in enumerate(coords):
+            if c < 0 or c >= self.shape[i]:
+                raise ValueError(f"Coordinate {c} out of bounds for dimension {i} with shape {self.shape[i]}")
+            offset += c * self.stride[i]
+        return offset
+    
+    def linear_to_coord(self, index: int) -> tuple[int, ...]:
+        """Convert linear index to multi-dimensional coordinate based on shape.
+        
+        This performs the inverse of converting coordinates to a linear index
+        in row-major order through the shape.
+        
+        Args:
+            index: Linear index (0-based) in range [0, size)
+        
+        Returns:
+            Tuple of coordinates corresponding to the linear index
+        
+        Raises:
+            ValueError: If index is out of bounds
+        
+        Example:
+            layout = Layout(shape=(5, 10), stride=(10, 20))
+            layout.linear_to_coord(7) -> (0, 7)
+            layout.linear_to_coord(12) -> (1, 2)
+        """
+        if index < 0 or index >= self.size:
+            raise ValueError(f"Index {index} out of bounds for size {self.size}")
+        
+        coords = []
+        remaining = index
+        
+        # Convert from linear index to multi-dimensional coordinate (row-major)
+        for i in range(self.rank - 1, -1, -1):
+            coords.append(remaining % self.shape[i])
+            remaining //= self.shape[i]
+        
+        # Reverse to get correct order
+        coords.reverse()
+        return tuple(coords)
+    
+    def linear_to_offset(self, index: int) -> int:
+        """Convert linear index to layout offset.
+        
+        This first converts the linear index to multi-dimensional coordinates
+        (based on shape), then computes the layout offset using the strides.
+        
+        Args:
+            index: Linear index (0-based) in range [0, size)
+        
+        Returns:
+            Layout offset computed as sum(coord[i] * stride[i])
+        
+        Raises:
+            ValueError: If index is out of bounds
+        
+        Example:
+            layout = Layout(shape=(5, 10), stride=(10, 20))
+            # Linear index 7 -> coord (0, 7) -> offset 0*10 + 7*20 = 140
+            layout.linear_to_offset(7) -> 140
+            # Linear index 12 -> coord (1, 2) -> offset 1*10 + 2*20 = 50
+            layout.linear_to_offset(12) -> 50
+        """
+        coord = self.linear_to_coord(index)
+        return self.coord_to_offset(*coord)
+    
+    def is_unique(self) -> bool:
+        """Check if layout has no broadcast dimensions (all strides non-zero).
+        
+        Returns:
+            True if no broadcast dimensions exist
+        """
+        return all(s != 0 for s in self.stride)
+    
+    def is_coalesced(self) -> bool:
+        """Check if layout has unit stride in the innermost (last) dimension.
+        
+        Returns:
+            True if innermost stride is 1
+        """
+        return self.stride[-1] == 1
+    
+    def __call__(self, *args: int) -> int:
+        """Make Layout callable like CuTe's Layout function object.
+        
+        Supports two modes:
+        1. Single argument: treats as linear index, returns layout offset
+        2. Multiple arguments: treats as coordinates, returns layout offset
+        
+        Args:
+            *args: Either a single linear index or multiple coordinates
+        
+        Returns:
+            Layout offset
+        
+        Examples:
+            layout = Layout(shape=(5, 10), stride=(10, 20))
+            
+            # Linear index mode (single argument)
+            layout(7)      # → 140 (converts 7 to coord (0,7), then 0*10+7*20)
+            layout(12)     # → 50  (converts 12 to coord (1,2), then 1*10+2*20)
+            
+            # Coordinate mode (multiple arguments)
+            layout(0, 7)   # → 140 (0*10 + 7*20)
+            layout(1, 2)   # → 50  (1*10 + 2*20)
+        """
+        if len(args) == 1:
+            # Single argument: linear index → offset
+            return self.linear_to_offset(args[0])
+        else:
+            # Multiple arguments: coordinates → offset
+            return self.coord_to_offset(*args)
+    
+    def __repr__(self) -> str:
+        return f"Layout(shape={self.shape}, stride={self.stride})"
+    
+    def __str__(self) -> str:
+        return self.to_string()
+    
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Layout):
+            return False
+        return self.shape == other.shape and self.stride == other.stride
+
+
 class slice_t:
     _wp_native_name_ = "slice_t"
 

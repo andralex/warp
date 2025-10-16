@@ -55,7 +55,7 @@ import warp
 import warp.build
 import warp.codegen
 import warp.config
-from warp.types import Array, launch_bounds_t
+from warp.types import Array, Layout, launch_bounds_t
 
 # represents either a built-in or user-defined function
 
@@ -6234,7 +6234,7 @@ def launch(
     record_cmd: bool = False,
     max_blocks: int = 0,
     block_dim: int = 256,
-    partition: str | None = None,
+    partition: str | Layout | None = None,
     offset: int = 0,
 ):
     """Launch a Warp kernel on the target device
@@ -6261,6 +6261,9 @@ def launch(
           Only has an effect for CUDA kernel launches.
           If negative or zero, the maximum hardware value will be used.
         block_dim: The number of threads per block (always 1 for "cpu" devices).
+        partition: Optional Layout object or string specifying kernel partitioning scheme.
+          Can be a wp.Layout object or a CuTe-style string like "(5,5):(2,20)".
+        offset: Starting offset for partitioned kernel launches.
     """
 
     init()
@@ -6290,7 +6293,16 @@ def launch(
     # Compute partition blocks if partition is specified
     partition_blocks = 0
     if partition is not None:
-        rank, partition_shape, partition_strides = warp.codegen.parse_cute_partition(partition)
+        # Handle both Layout objects and string format
+        if isinstance(partition, Layout):
+            partition_shape = partition.shape
+            partition_strides = partition.stride
+            rank = partition.rank
+        elif isinstance(partition, str):
+            rank, partition_shape, partition_strides = warp.codegen.parse_cute_partition(partition)
+        else:
+            raise TypeError(f"partition must be a Layout object or string, got {type(partition)}")
+        
         # Compute product of partition shape to get number of blocks
         partition_blocks = 1
         for s in partition_shape:
@@ -6335,8 +6347,9 @@ def launch(
         # delay load modules, including new overload if needed
         try:
             print(f"begin load partition >{partition}< ....")
-            # partition="pouet"
-            module_exec = kernel.module.load(device, block_dim, partition)
+            # Convert Layout object to string for module caching
+            partition_str = partition.to_string() if isinstance(partition, Layout) else partition
+            module_exec = kernel.module.load(device, block_dim, partition_str)
             print(f"after load ....")
         except Exception:
             kernel.adj.skip_build = True
