@@ -1621,6 +1621,8 @@ class launch_bounds_t(ctypes.Structure):
         ("shape", ctypes.c_int32 * LAUNCH_MAX_DIMS),
         ("ndim", ctypes.c_int32),
         ("size", ctypes.c_size_t),
+        ("offset", ctypes.c_int32),
+        ("partition_size", ctypes.c_int32)
     )
 
     def __init__(self, shape: int | Sequence[int]):
@@ -1629,11 +1631,13 @@ class launch_bounds_t(ctypes.Structure):
             self.ndim = 1
             self.size = shape
             self.shape[0] = shape
+            self.offset = 0
 
         else:
             # nd launch
             self.ndim = len(shape)
             self.size = 1
+            self.offset = 0
 
             for i in range(self.ndim):
                 self.shape[i] = shape[i]
@@ -1642,6 +1646,17 @@ class launch_bounds_t(ctypes.Structure):
         # initialize the remaining dims to 1
         for i in range(self.ndim, LAUNCH_MAX_DIMS):
             self.shape[i] = 1
+
+    def set_partition_params(self, offset, psize):
+        self.offset = offset
+        self.partition_size = psize
+
+    def __repr__(self):
+        shape_tuple = tuple(self.shape[i] for i in range(self.ndim))
+        return (
+            f"launch_bounds_t(shape={shape_tuple}, ndim={self.ndim}, "
+            f"size={self.size}, offset={self.offset}, partition_size={self.partition_size})"
+        )
 
 
 INT_WIDTH = ctypes.sizeof(ctypes.c_int) * 8

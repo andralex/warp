@@ -1206,6 +1206,8 @@ struct launch_bounds_t
     int shape[LAUNCH_MAX_DIMS]; // size of each dimension
     int ndim;                   // number of valid dimension
     size_t size;                // total number of threads
+    int offset;
+    int partition_size;
 };
 
 // represents coordinate in the launch grid
@@ -1257,8 +1259,16 @@ inline CUDA_CALLABLE int block_dim()
 #endif
 }
 
+inline CUDA_CALLABLE int apply_partition(const char *partition, int index, const launch_bounds_t& bounds)
+{
+    printf("[apply_partition] index %d partition %s offset %d partition_size %d\n", index, partition, bounds.offset, bounds.partition_size);
+    return 0;
+}
+
+// THERE
 inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
 {
+   // printf("tid(size_t index, const launch_bounds_t& bounds):1263\n");
     // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
     // Only do this in _DEBUG when called from device to avoid excessive register allocation
 #if defined(_DEBUG) || !defined(__CUDA_ARCH__)

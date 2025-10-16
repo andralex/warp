@@ -1885,7 +1885,9 @@ class ModuleBuilder:
         if device == "cpu":
             source = warp.codegen.cpu_module_header.format(block_dim=self.options["block_dim"]) + source
         else:
-            source = warp.codegen.cuda_module_header.format(block_dim=self.options["block_dim"]) + source
+            import traceback
+            traceback.print_stack()
+            source = warp.codegen.cuda_module_header.format(block_dim=self.options["block_dim"], have_partition=self.options["have_partition"], partition=self.options["partition"]) + source
 
         return source
 
@@ -2040,7 +2042,7 @@ class Module:
         # set of device contexts where the build has failed
         self.failed_builds = set()
 
-        # hash data, including the module hash. Module may store multiple hashes (one per block_dim used)
+        # hash data, including the module hash. Module may store multiple hashes (one per block_dim and partition used)
         self.hashers = {}
 
         # LLVM executable modules are identified using strings.  Since it's possible for multiple
@@ -2211,22 +2213,25 @@ class Module:
                 add_ref(arg.type.module)
 
     def hash_module(self) -> bytes:
-        """Get the hash of the module for the current block_dim.
+        """Get the hash of the module for the current block_dim and partition.
 
         This function always creates a new `ModuleHasher` instance and computes the hash.
         """
         # compute latest hash
         block_dim = self.options["block_dim"]
-        self.hashers[block_dim] = ModuleHasher(self)
-        return self.hashers[block_dim].get_module_hash()
+        partition = self.options["partition"]
+        self.hashers[(block_dim,partition)] = ModuleHasher(self)
+        return self.hashers[(block_dim,partition)].get_module_hash()
 
-    def get_module_hash(self, block_dim: int | None = None) -> bytes:
-        """Get the hash of the module for the current block_dim.
+    def get_module_hash(self, block_dim: int | None = None, partition: str | None = None) -> bytes:
+        """Get the hash of the module for the current block_dim and partition.
 
-        If a hash has not been computed for the current block_dim, it will be computed and cached.
+        If a hash has not been computed for the current block_dim/partition, it will be computed and cached.
         """
         if block_dim is None:
             block_dim = self.options["block_dim"]
+        if partition is None:
+            partition = self.options["partition"]
 
         if self.has_unresolved_static_expressions:
             # The module hash currently does not account for unresolved static expressions
@@ -2243,10 +2248,12 @@ class Module:
             self.has_unresolved_static_expressions = False
 
         # compute the hash if needed
-        if block_dim not in self.hashers:
-            self.hashers[block_dim] = ModuleHasher(self)
+        # Use (block_dim, partition) as the key to ensure different partitions get different hashes
+        hasher_key = (block_dim, partition)
+        if hasher_key not in self.hashers:
+            self.hashers[hasher_key] = ModuleHasher(self)
 
-        return self.hashers[block_dim].get_module_hash()
+        return self.hashers[hasher_key].get_module_hash()
 
     def _use_ptx(self, device) -> bool:
         return device.get_cuda_output_format(self.options.get("cuda_output")) == "ptx"
@@ -2382,6 +2389,8 @@ class Module:
                 with open(source_code_path, "w") as cpp_file:
                     cpp_file.write(cpp_source)
 
+                print(f"Generated CPU source file: {source_code_path}")
+
                 output_path = os.path.join(build_dir, output_name)
 
                 # build object code
@@ -2413,6 +2422,8 @@ class Module:
 
                 with open(source_code_path, "w") as cu_file:
                     cu_file.write(cu_source)
+
+                print(f"Generated CUDA source file: {source_code_path}")
 
                 output_path = os.path.join(build_dir, output_name)
 
@@ -2501,6 +2512,7 @@ class Module:
         self,
         device,
         block_dim: int | None = None,
+        partition: str | None = None,
         binary_path: os.PathLike | None = None,
         output_arch: int | None = None,
         meta_path: os.PathLike | None = None,
@@ -2511,19 +2523,34 @@ class Module:
         if block_dim is not None:
             self.options["block_dim"] = block_dim
 
+        self.options["have_partition"] = 1 if partition is not None else 0
+        self.options["partition"] = partition
+
         active_block_dim = self.options["block_dim"]
 
+        print(f"Module options: {self.options}")
+
         # check if executable module is already loaded and not stale
-        exec = self.execs.get((device.context, active_block_dim))
+        # Include partition in the cache key to avoid reusing modules compiled with different partition settings
+        exec = self.execs.get((device.context, active_block_dim, partition))
         if exec is not None:
-            if self.options["strip_hash"] or (exec.module_hash == self.get_module_hash(active_block_dim)):
+            if self.options["strip_hash"] or (exec.module_hash == self.get_module_hash(active_block_dim, partition)):
+                # Print source file location for already-loaded module
+                module_name_short = self.get_module_identifier()
+                module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
+                source_ext = ".cu" if device.is_cuda else ".cpp"
+                source_path = os.path.join(module_dir, f"{module_name_short}{source_ext}")
+                if os.path.exists(source_path):
+                    print(f"Module already loaded, source file: {source_path}")
+                else:
+                    print(f"Module already loaded (source file not found in cache)")
                 return exec
 
         # quietly avoid repeated build attempts to reduce error spew
         if device.context in self.failed_builds:
             return None
 
-        module_hash = self.get_module_hash(active_block_dim)
+        module_hash = self.get_module_hash(active_block_dim, partition)
 
         # use a unique module path using the module short hash
         module_name_short = self.get_module_identifier()
@@ -2556,6 +2583,11 @@ class Module:
                     raise FileNotFoundError(f"Binary file {binary_path} does not exist")
                 else:
                     module_load_timer.extra_msg = " (cached)"
+                    # Print the source file path (inferred from binary path)
+                    source_ext = ".cu" if device.is_cuda else ".cpp"
+                    source_path = os.path.splitext(binary_path)[0] + source_ext
+                    if os.path.exists(source_path):
+                        print(f"Using provided source file: {source_path}")
             else:
                 # we will build if binary doesn't exist yet
                 # we will rebuild if we are not caching kernels or if we are tracking array access
@@ -2582,6 +2614,11 @@ class Module:
                     module_load_timer.extra_msg = " (compiled)"
                 else:
                     module_load_timer.extra_msg = " (cached)"
+                    # Print the cached source file path
+                    source_ext = ".cu" if device.is_cuda else ".cpp"
+                    cached_source_path = os.path.join(module_dir, f"{module_name_short}{source_ext}")
+                    if os.path.exists(cached_source_path):
+                        print(f"Using cached source file: {cached_source_path}")
 
             # -----------------------------------------------------------
             # Load CPU or CUDA binary
@@ -2598,13 +2635,13 @@ class Module:
                 self.cpu_exec_id += 1
                 runtime.llvm.wp_load_obj(binary_path.encode("utf-8"), module_handle.encode("utf-8"))
                 module_exec = ModuleExec(module_handle, module_hash, device, meta)
-                self.execs[(None, active_block_dim)] = module_exec
+                self.execs[(None, active_block_dim, partition)] = module_exec
 
             elif device.is_cuda:
                 cuda_module = warp.build.load_cuda(binary_path, device)
                 if cuda_module is not None:
                     module_exec = ModuleExec(cuda_module, module_hash, device, meta)
-                    self.execs[(device.context, active_block_dim)] = module_exec
+                    self.execs[(device.context, active_block_dim, partition)] = module_exec
                 else:
                     module_load_timer.extra_msg = " (error)"
                     raise Exception(f"Failed to load CUDA module '{self.name}'")
@@ -6041,6 +6078,9 @@ class Launch:
         if self.params_addr:
             self.params_addr[0] = ctypes.c_void_p(ctypes.addressof(self.bounds))
 
+    def set_offset(self, offset: int):
+        self.offset = offset
+
     def set_param_at_index(self, index: int, value: Any, adjoint: bool = False):
         """Set a kernel parameter at an index.
 
@@ -6185,6 +6225,8 @@ def launch(
     record_cmd: bool = False,
     max_blocks: int = 0,
     block_dim: int = 256,
+    partition: str | None = None,
+    offset: int = 0,
 ):
     """Launch a Warp kernel on the target device
 
@@ -6214,6 +6256,8 @@ def launch(
 
     init()
 
+    print(f"Begin launch PARTITION={partition}, offset={offset}.")
+
     # if stream is specified, use the associated device
     if stream is not None:
         device = stream.device
@@ -6233,6 +6277,9 @@ def launch(
 
     # construct launch bounds
     bounds = launch_bounds_t(dim)
+    # TODO
+    bounds.set_partition_params(offset, bounds.size)
+    print(f"bounds {bounds}")
 
     if bounds.size > 0:
         # first param is the number of threads
@@ -6241,6 +6288,7 @@ def launch(
 
         # converts arguments to kernel's expected ctypes and packs into params
         def pack_args(args, params, adjoint=False):
+            # TODO add offset as first argument if partition
             for i, a in enumerate(args):
                 arg_type = kernel.adj.args[i].type
                 arg_name = kernel.adj.args[i].label
@@ -6267,7 +6315,10 @@ def launch(
 
         # delay load modules, including new overload if needed
         try:
-            module_exec = kernel.module.load(device, block_dim)
+            print(f"begin load partition >{partition}< ....")
+            # partition="pouet"
+            module_exec = kernel.module.load(device, block_dim, partition)
+            print(f"after load ....")
         except Exception:
             kernel.adj.skip_build = True
             raise
@@ -6375,6 +6426,7 @@ def launch(
                     return launch
                 else:
                     # launch
+                    print(f"runtime.core.wp_cuda_launch_kernel bounds.size={bounds.size}")
                     runtime.core.wp_cuda_launch_kernel(
                         device.context,
                         hooks.forward,

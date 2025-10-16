@@ -4301,6 +4301,7 @@ size_t wp_cuda_launch_kernel(void* context, void* kernel, size_t dim, int max_bl
 
     begin_cuda_range(WP_TIMING_KERNEL, stream, context, get_cuda_kernel_name(kernel));
 
+    fprintf(stderr, "cuLaunchKernel_f grid_dim = %d block_dim %d\n", grid_dim, block_dim);
     CUresult res = cuLaunchKernel_f(
         (CUfunction)kernel,
         grid_dim, 1, 1,

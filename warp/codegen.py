@@ -3561,8 +3561,14 @@ cpu_module_header = """
 
 cuda_module_header = """
 #define WP_TILE_BLOCK_DIM {block_dim}
+#define WP_HAVE_PARTITION {have_partition}
+#define WP_PARTITION {partition}
 #define WP_NO_CRT
 #include "builtin.h"
+
+// Stringification helper macros
+#define WP_STRINGIFY(x) #x
+#define WP_TOSTRING(x) WP_STRINGIFY(x)
 
 // Map wp.breakpoint() to a device brkpt at the call site so cuda-gdb attributes the stop to the generated .cu line
 #if defined(__CUDACC__) && !defined(_MSC_VER)
@@ -3583,6 +3589,7 @@ cuda_module_header = """
 
 #define builtin_block_dim() wp::block_dim()
 
+#define builtin_apply_partition(x) wp::apply_partition(WP_TOSTRING(WP_PARTITION), x, dim)
 """
 
 struct_template = """
@@ -3655,16 +3662,27 @@ cuda_reverse_function_template = """
 
 """
 
+# CHANGE HERE to have a _idx_base variable and _idx = _idx_base or partition(_idx_base)+offset
 cuda_kernel_template_forward = """
 
 {line_directive}extern "C" __global__ void {name}_cuda_kernel_forward(
     {forward_args})
 {{
-{line_directive}    for (size_t _idx = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
-{line_directive}         _idx < dim.size;
-{line_directive}         _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
+{line_directive}    size_t upper_bound = (WP_HAVE_PARTITION)?static_cast<size_t>(dim.partition_size)*static_cast<size_t>(blockDim.x):static_cast<size_t>(dim.size);
+{line_directive}    for (size_t _idx_orig = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
+{line_directive}         _idx_orig < upper_bound;
+{line_directive}         _idx_orig += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
     {{
         // reset shared memory allocator
+{line_directive}        #if WP_HAVE_PARTITION
+{line_directive}        size_t block_id = _idx_orig/blockDim.x;
+{line_directive}        size_t virtual_block_id = block_id + dim.offset;
+{line_directive}        builtin_apply_partition(virtual_block_id);
+{line_directive}        size_t _idx = (_idx_orig%blockDim.x) + virtual_block_id * blockDim.x;
+{line_directive}        #else
+{line_directive}        size_t _idx = _idx_orig;
+{line_directive}        #endif
+{line_directive}        
 {line_directive}        wp::tile_alloc_shared(0, true);
 
 {forward_body}{line_directive}    }}
@@ -4106,6 +4124,10 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None):
 
     forward_args = []
     reverse_args = []
+
+    import traceback
+    traceback.print_stack()
+    print(f"FORWARD ARGS ... self.options={self.options}");
 
     # forward args
     for i, arg in enumerate(adj.args):
