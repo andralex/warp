@@ -3540,39 +3540,23 @@ class Adjoint:
 
 def parse_cute_partition(partition_str):
     """Parse a Cute layout partition string like '(8,4,2):(3,4,1)'.
-    
+
     Returns:
         tuple: (rank, shape_list, stride_list) or (0, [], []) if partition_str is None
     """
+
     if partition_str is None:
         return (0, [], [])
-    
-    # Split by ':' to separate shape and strides
-    parts = partition_str.split(':')
-    if len(parts) != 2:
-        raise ValueError(f"Invalid partition format: {partition_str}. Expected format: '(a,b,c):(d,e,f)'")
-    
-    shape_str, stride_str = parts
-    
-    # Parse shape tuple
-    shape_str = shape_str.strip()
-    if not (shape_str.startswith('(') and shape_str.endswith(')')):
-        raise ValueError(f"Invalid shape format: {shape_str}. Expected format: '(a,b,c)'")
-    shape_list = [int(x.strip()) for x in shape_str[1:-1].split(',') if x.strip()]
-    
-    # Parse stride tuple
-    stride_str = stride_str.strip()
-    if not (stride_str.startswith('(') and stride_str.endswith(')')):
-        raise ValueError(f"Invalid stride format: {stride_str}. Expected format: '(d,e,f)'")
-    stride_list = [int(x.strip()) for x in stride_str[1:-1].split(',') if x.strip()]
-    
-    # Validate that both have the same length
+
+    if len(parts := partition_str.split(':')) != 2:
+        raise ValueError(f"Invalid partition format: {partition_str}")
+
+    shape_list, stride_list = map(lambda x: list(ast.literal_eval(x)), parts)
+
     if len(shape_list) != len(stride_list):
         raise ValueError(f"Shape and stride must have same length. Got shape={shape_list}, stride={stride_list}")
-    
-    rank = len(shape_list)
-    return (rank, shape_list, stride_list)
 
+    return (len(shape_list), shape_list, stride_list)
 
 cpu_module_header = """
 #define WP_TILE_BLOCK_DIM {block_dim}
@@ -3725,7 +3709,7 @@ cuda_kernel_template_forward = """
 {line_directive}        #else
 {line_directive}        size_t _idx = _idx_orig;
 {line_directive}        #endif
-{line_directive}        
+{line_directive}
 {line_directive}        wp::tile_alloc_shared(0, true);
 
 {forward_body}{line_directive}    }}
